@@ -1,0 +1,15 @@
+# Runtime logs and generated data
+*.log
+*.out
+clash-free-stats.json
+.clash-monitor-cache/
+
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local machine/editor files
+.DS_Store
+.env
