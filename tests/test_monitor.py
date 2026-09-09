@@ -1422,6 +1422,28 @@ class RuntimeSwitchTransactionTests(OfflineTestCase):
         self.assertFalse(outcome.rollback_failed)
         self.assertIs(outcome.route_ok, False)
 
+    def test_auth_block_after_switch_rolls_back_and_stops_later_candidates(self) -> None:
+        proxies = self.route_proxies("CandidateOne", "CandidateTwo")
+        candidate_live = self.proxies_with_now(proxies, "CandidateOne")
+        results = [delay_result(name, 400, subscription="paid") for name in ("CandidateOne", "CandidateTwo")]
+        with (
+            mock.patch.object(monitor, "fetch_live_proxies", side_effect=[proxies, proxies, candidate_live]),
+            mock.patch.object(monitor, "run_delay_checks", return_value=results),
+            mock.patch.object(monitor, "switch_group") as switch,
+            mock.patch.object(monitor, "verify_selector_selections"),
+            mock.patch.object(monitor, "guarded_comprehensive_route_check", return_value=(None, "API: HTTP 401")) as probe,
+        ):
+            with self.assertRaises(monitor.codex_probe.ProbeError):
+                monitor.auto_switch_if_needed(
+                    self.controller, proxies, 7897, False, args_for_switch(),
+                    ["rule", "OpenAI", "Old"],
+                )
+        self.assertEqual(
+            [mock.call(self.controller, "OpenAI", "CandidateOne"), mock.call(self.controller, "OpenAI", "Old")],
+            switch.call_args_list,
+        )
+        probe.assert_called_once()
+
     def test_rollback_failure_stops_before_later_candidates(self) -> None:
         proxies = self.route_proxies("CandidateOne", "CandidateTwo")
         candidate_live = self.proxies_with_now(proxies, "CandidateOne")

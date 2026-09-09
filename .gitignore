@@ -1,4 +1,5 @@
 # Runtime logs and generated data
+/logs/
 *.log
 *.out
 clash-free-stats.json

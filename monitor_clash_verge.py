@@ -23,6 +23,7 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import logging
 import os
 import re
 import shutil
@@ -36,18 +37,17 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
+import codex_probe
+
 
 DEFAULT_TEST_URL = "https://chatgpt.com/cdn-cgi/trace"
-DEFAULT_OPENAI_API_URL = "https://api.openai.com/v1/models"
-DEFAULT_OPENAI_SSE_URL = "https://api.openai.com/v1/responses"
-DEFAULT_OPENAI_WEBSOCKET_URL = "wss://api.openai.com/v1/responses"
-DEFAULT_OPENAI_STREAM_MODEL = "gpt-5.6"
 DEFAULT_EXCLUDE_REGEX = r"香港|港|🇭🇰|Hong\s*Kong|HongKong|\bHKG\b|\bHK(?:\b|[0-9_-])"
 DEFAULT_SKIP_CANDIDATE_REGEX = r"剩余流量|套餐到期|距离下次重置|Traffic|Expire|Reset"
 DEFAULT_FREE_SUBSCRIPTION_URLS = (
@@ -61,7 +61,9 @@ ANSI_RESET = "\033[0m"
 CLASH_VERGE_DIR = (
     Path.home() / "Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
 )
-DEFAULT_LOG_DIR = Path.cwd()
+DEFAULT_LOG_DIR = Path(__file__).resolve().parent / "logs"
+MAX_LOG_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
 DEFAULT_CACHE_DIR = Path.cwd() / ".clash-monitor-cache"
 DEFAULT_FREE_STATS_PATH = Path.cwd() / "clash-free-stats.json"
 DEFAULT_PROFILES_YAML = CLASH_VERGE_DIR / "profiles.yaml"
@@ -101,7 +103,7 @@ GROUP_TYPES = {
     "Compatible",
 }
 SKIP_PROXY_NAMES = {"DIRECT", "REJECT", "REJECT-DROP", "PASS"}
-LOG_FILE: Any = None
+LOG_FILE: RotatingFileHandler | None = None
 
 
 class ApiError(Exception):
@@ -211,6 +213,7 @@ class RunOutcome:
     no_available_chatgpt_node: bool = False
     route_failure_streak: int = 0
     active_config_path: str = ""
+    route_ok: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -220,13 +223,6 @@ class SwitchOutcome:
     switched: bool = False
     config_path: str = ""
     rollback_failed: bool = False
-
-
-@dataclass(frozen=True)
-class ProbeStep:
-    name: str
-    ok: bool
-    message: str
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
@@ -251,8 +247,7 @@ def log(*values: Any, sep: str = " ", end: str = "\n", file: Any = None, flush: 
     text = sep.join(str(value) for value in values)
     print(text, end=end, file=target, flush=flush)
     if LOG_FILE is not None and target in (sys.stdout, sys.stderr):
-        LOG_FILE.write(strip_ansi(text) + end)
-        LOG_FILE.flush()
+        write_log_file(text + end)
 
 
 def clean_yaml_scalar(value: str) -> str:
@@ -1833,45 +1828,6 @@ def check_via_mixed_proxy(
     return False, f"{failures[-1]}（连续 {len(failures)} 次失败；最近错误：{recent}）"
 
 
-def opener_for_mixed_proxy(port: int) -> Any:
-    proxy_url = f"http://127.0.0.1:{port}"
-    return build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
-
-
-def probe_api_https_via_mixed_proxy(url: str, port: int, timeout_s: float) -> ProbeStep:
-    opener = opener_for_mixed_proxy(port)
-    request = Request(
-        url,
-        headers={
-            "Authorization": "Bearer probe",
-            "User-Agent": "clash-verge-monitor/1.0",
-        },
-    )
-    started = time.perf_counter()
-    try:
-        with opener.open(request, timeout=timeout_s) as response:
-            elapsed_ms = int((time.perf_counter() - started) * 1000)
-            ok = 200 <= response.status < 400
-            return ProbeStep(
-                "API HTTPS",
-                ok,
-                f"HTTP {response.status}, {elapsed_ms} 毫秒",
-            )
-    except HTTPError as exc:
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        ok = exc.code == 401
-        suffix = "（鉴权挑战，API 域名可达）" if ok else ""
-        return ProbeStep("API HTTPS", ok, f"HTTP {exc.code}, {elapsed_ms} 毫秒{suffix}")
-    except (OSError, URLError) as exc:
-        return ProbeStep("API HTTPS", False, str(exc))
-
-
-def openai_probe_key(args: argparse.Namespace, strict: bool) -> str:
-    if not strict:
-        return "probe"
-    return os.getenv(args.openai_api_key_env, "")
-
-
 def strict_openai_destination_ok(url: str, scheme: str) -> bool:
     parsed = urlparse(url)
     try:
@@ -1887,264 +1843,62 @@ def strict_openai_destination_ok(url: str, scheme: str) -> bool:
     )
 
 
-def probe_sse_via_mixed_proxy(args: argparse.Namespace, port: int, timeout_s: float) -> ProbeStep:
-    strict = args.strict_stream_probes
-    if strict and not strict_openai_destination_ok(args.openai_sse_url, "https"):
-        return ProbeStep(
-            "SSE",
-            False,
-            "严格探测只允许把真实 API Key 发送到 https://api.openai.com",
-        )
-    api_key = openai_probe_key(args, strict)
-    if strict and not api_key:
-        return ProbeStep(
-            "SSE",
-            False,
-            f"缺少 {args.openai_api_key_env}，无法验证真实 SSE 首事件",
-        )
-
-    opener = opener_for_mixed_proxy(port)
-    payload = json.dumps(
-        {
-            "model": args.openai_stream_model,
-            "input": "ping",
-            "stream": True,
-            "store": False,
-            "max_output_tokens": 1,
-        }
-    ).encode("utf-8")
-    request = Request(
-        args.openai_sse_url,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Accept": "text/event-stream",
-            "Content-Type": "application/json",
-            "User-Agent": "clash-verge-monitor/1.0",
-        },
-        method="POST",
-    )
-    started = time.perf_counter()
-    try:
-        with opener.open(request, timeout=timeout_s) as response:
-            for _ in range(32):
-                line = response.readline(4096)
-                if not line:
-                    break
-                if line.startswith((b"event:", b"data:")):
-                    elapsed_ms = int((time.perf_counter() - started) * 1000)
-                    return ProbeStep("SSE", True, f"首事件 {elapsed_ms} 毫秒")
-            elapsed_ms = int((time.perf_counter() - started) * 1000)
-            return ProbeStep("SSE", False, f"HTTP {response.status} 但未收到 SSE 事件，{elapsed_ms} 毫秒")
-    except HTTPError as exc:
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        if not strict and exc.code in {400, 401}:
-            return ProbeStep(
-                "SSE",
-                True,
-                f"预检 HTTP {exc.code}, {elapsed_ms} 毫秒（端点可达，未验证真实流）",
-            )
-        return ProbeStep("SSE", False, f"HTTP {exc.code}, {elapsed_ms} 毫秒")
-    except (OSError, URLError) as exc:
-        return ProbeStep("SSE", False, str(exc))
-
-
-def read_http_header(sock: socket.socket, max_bytes: int = 65536) -> bytes:
-    chunks: list[bytes] = []
-    total = 0
-    while total < max_bytes:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        total += len(chunk)
-        if b"\r\n\r\n" in b"".join(chunks):
-            break
-    return b"".join(chunks)
-
-
-def parse_http_status(header_bytes: bytes) -> tuple[int | None, str]:
-    text = header_bytes.decode("iso-8859-1", errors="replace")
-    first_line = text.splitlines()[0] if text.splitlines() else ""
-    parts = first_line.split(None, 2)
-    if len(parts) >= 2 and parts[1].isdigit():
-        return int(parts[1]), first_line
-    return None, first_line or "empty response"
-
-
-def websocket_status_via_mixed_proxy(
-    url: str,
-    port: int,
-    timeout_s: float,
-    headers: dict[str, str],
-) -> tuple[int | None, str, int]:
-    parsed = urlparse(url)
-    if parsed.scheme != "wss" or not parsed.hostname:
-        raise ValueError(f"只支持 wss:// WebSocket 探测地址：{url}")
-
-    host = parsed.hostname
-    target_port = parsed.port or 443
-    path = parsed.path or "/"
-    if parsed.query:
-        path = f"{path}?{parsed.query}"
-
-    started = time.perf_counter()
-    raw_sock: socket.socket | None = socket.create_connection(
-        ("127.0.0.1", port),
-        timeout=timeout_s,
-    )
-    try:
-        raw_sock.settimeout(timeout_s)
-        connect_request = (
-            f"CONNECT {host}:{target_port} HTTP/1.1\r\n"
-            f"Host: {host}:{target_port}\r\n"
-            "Proxy-Connection: keep-alive\r\n"
-            "\r\n"
-        ).encode("ascii")
-        raw_sock.sendall(connect_request)
-        connect_header = read_http_header(raw_sock)
-        connect_status, connect_line = parse_http_status(connect_header)
-        if connect_status != 200:
-            elapsed_ms = int((time.perf_counter() - started) * 1000)
-            return connect_status, f"CONNECT {connect_line}", elapsed_ms
-
-        context = ssl.create_default_context()
-        tls_sock = context.wrap_socket(raw_sock, server_hostname=host)
-        raw_sock = None
-        try:
-            tls_sock.settimeout(timeout_s)
-            ws_key = base64.b64encode(os.urandom(16)).decode("ascii")
-            lines = [
-                f"GET {path} HTTP/1.1",
-                f"Host: {host}",
-                "Upgrade: websocket",
-                "Connection: Upgrade",
-                f"Sec-WebSocket-Key: {ws_key}",
-                "Sec-WebSocket-Version: 13",
-                "User-Agent: clash-verge-monitor/1.0",
-            ]
-            for key, value in headers.items():
-                if value:
-                    lines.append(f"{key}: {value}")
-            lines.extend(["", ""])
-            tls_sock.sendall("\r\n".join(lines).encode("ascii"))
-            response_header = read_http_header(tls_sock)
-        finally:
-            tls_sock.close()
-    finally:
-        if raw_sock is not None:
-            raw_sock.close()
-
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
-    status, line = parse_http_status(response_header)
-    return status, line, elapsed_ms
-
-
-def probe_websocket_via_mixed_proxy(args: argparse.Namespace, port: int, timeout_s: float) -> ProbeStep:
-    strict = args.strict_stream_probes
-    if strict and not strict_openai_destination_ok(
-        args.openai_websocket_url,
-        "wss",
-    ):
-        return ProbeStep(
-            "WS",
-            False,
-            "严格探测只允许把真实 API Key 发送到 wss://api.openai.com",
-        )
-    api_key = openai_probe_key(args, strict)
-    if strict and not api_key:
-        return ProbeStep(
-            "WS",
-            False,
-            f"缺少 {args.openai_api_key_env}，无法验证 WebSocket 101 握手",
-        )
-
-    try:
-        status, line, elapsed_ms = websocket_status_via_mixed_proxy(
-            args.openai_websocket_url,
-            port,
-            timeout_s,
-            {"Authorization": f"Bearer {api_key}"},
-        )
-    except Exception as exc:
-        return ProbeStep("WS", False, str(exc))
-
-    if status == 101:
-        return ProbeStep("WS", True, f"101 Switching Protocols, {elapsed_ms} 毫秒")
-    if not strict and status in {400, 401}:
-        return ProbeStep(
-            "WS",
-            True,
-            f"预检 HTTP {status}, {elapsed_ms} 毫秒（端点可达，未验证 101）",
-        )
-    return ProbeStep("WS", False, f"{line}, {elapsed_ms} 毫秒")
-
-
-def format_probe_steps(steps: list[ProbeStep]) -> str:
-    parts: list[str] = []
-    for step in steps:
-        message = zh_error(step.message)
-        parts.append(message if step.name == "HTTP" else f"{step.name} {message}")
-    return "; ".join(parts)
-
 
 def comprehensive_route_check(
     args: argparse.Namespace,
     port: int,
     attempts: int | None = None,
-) -> tuple[bool, str]:
+) -> tuple[bool | None, str]:
+    """True means the selected scope passed; None blocks node switching."""
+    try:
+        cfg = codex_probe.settings(args)
+    except codex_probe.ProbeError as exc:
+        return None, f"{codex_probe.probe_label(args)}受阻：{exc}"
+    # Route selection must follow the actual model backend, including API-key
+    # mode; the CDN URL remains only the cheap candidate latency filter.
+    args._codex_route_url = cfg.sse_url
     timeout_s = max(args.timeout / 1000 + 2, 3)
     max_attempts = max(1, attempts if attempts is not None else args.route_retries)
     failures: list[str] = []
-
     for attempt in range(1, max_attempts + 1):
-        http_ok, http_message = check_via_mixed_proxy(
-            args.url,
-            port,
-            timeout_s=timeout_s,
-            attempts=1,
-        )
-        steps = [ProbeStep("HTTP", http_ok, http_message)]
-        if http_ok and not args.quick_route_only:
-            if not args.skip_api_probe:
-                steps.append(
-                    probe_api_https_via_mixed_proxy(args.openai_api_url, port, timeout_s)
-                )
-            if not args.skip_sse_probe:
-                steps.append(probe_sse_via_mixed_proxy(args, port, timeout_s))
-            if not args.skip_websocket_probe:
-                steps.append(probe_websocket_via_mixed_proxy(args, port, timeout_s))
-
-        message = format_probe_steps(steps)
-        if all(step.ok for step in steps):
-            if attempt == 1:
-                return True, message
-            return (
-                True,
-                f"{message}（第 {attempt}/{max_attempts} 次综合探测成功）",
-            )
-
+        http_ok, http_message = check_via_mixed_proxy(args.url, port, timeout_s=timeout_s, attempts=1)
+        messages = [f"HTTP 基础连接：{http_message}"]
+        results: list[bool | None] = [http_ok]
+        if http_ok:
+            probes = [("API", codex_probe.probe_models)]
+            if cfg.mode == "generation":
+                probes.extend([("SSE", codex_probe.probe_sse), ("WebSocket", codex_probe.probe_websocket)])
+            else:
+                probes.append(("WebSocket", codex_probe.probe_websocket_network))
+            for name, probe in probes:
+                ok, message = codex_probe.run_step(name, probe, cfg, port)
+                results.append(ok)
+                messages.append(message)
+                if ok is None:
+                    return None, "; ".join(messages) + "；本轮停止节点切换"
+        scope = f"模式=生成，模型={cfg.model}" if cfg.mode == "generation" else "模式=网络（鉴权/API/WS 往返，不执行模型生成或 SSE 生成流测试）"
+        message = f"认证={cfg.credentials.mode}，{scope}；" + "; ".join(messages)
+        if all(result is True for result in results):
+            suffix = f"（第 {attempt}/{max_attempts} 次成功）" if attempt > 1 else ""
+            return True, message + suffix
         failures.append(message)
         if attempt < max_attempts and args.route_retry_delay > 0:
             time.sleep(args.route_retry_delay)
-
-    if len(failures) == 1:
-        return False, failures[-1]
-    return (
-        False,
-        f"{failures[-1]}（连续 {len(failures)} 次综合探测失败）",
-    )
+    suffix = f"（连续 {len(failures)} 次真实验证失败）" if len(failures) > 1 else ""
+    return False, failures[-1] + suffix
 
 
 def guarded_comprehensive_route_check(
     args: argparse.Namespace,
     port: int,
     attempts: int | None = None,
-) -> tuple[bool, str]:
+) -> tuple[bool | None, str]:
     try:
         return comprehensive_route_check(args, port, attempts=attempts)
     except Exception as exc:
-        return False, f"综合探测异常：{exc}"
+        # Internal/configuration errors must not cycle through every proxy node.
+        # Avoid logging exception bodies that could contain credentials.
+        return None, f"Codex 真实验证异常（{type(exc).__name__}）；本轮停止节点切换"
 
 
 def advance_route_failure_streak(route_ok: bool | None, current: int) -> int:
@@ -2256,27 +2010,47 @@ def zh_error(text: str) -> str:
     return result
 
 
+class PrivateRotatingFileHandler(RotatingFileHandler):
+    """Keep newly created log files private, including after rollover."""
+
+    def _open(self) -> Any:
+        fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            return os.fdopen(fd, self.mode, encoding=self.encoding, errors=self.errors)
+        except BaseException:
+            os.close(fd)
+            raise
+
+
 def default_log_path() -> Path:
-    return DEFAULT_LOG_DIR / f"clash-monitor-{datetime.now().strftime('%Y%m%d')}.log"
+    return DEFAULT_LOG_DIR / "clash-monitor.log"
+
+
+def write_log_file(text: str) -> None:
+    if LOG_FILE is not None:
+        LOG_FILE.handle(logging.LogRecord(
+            "clash-monitor", logging.INFO, __file__, 0, strip_ansi(text), (), None,
+        ))
 
 
 def setup_log_file(args: argparse.Namespace) -> Path | None:
     global LOG_FILE
 
+    close_log_file()
     if args.no_log_file:
         return None
 
     path = Path(args.log_file).expanduser() if args.log_file else default_log_path()
+    if not path.is_absolute():
+        path = DEFAULT_LOG_DIR / path
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.touch(mode=0o600, exist_ok=True)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
-    LOG_FILE = path.open("a", encoding="utf-8")
-    LOG_FILE.write("\n" + "=" * 88 + "\n")
-    LOG_FILE.write(f"会话开始：{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-    LOG_FILE.flush()
+    LOG_FILE = PrivateRotatingFileHandler(
+        path, maxBytes=MAX_LOG_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
+    )
+    LOG_FILE.terminator = ""
+    write_log_file("\n" + "=" * 88 + "\n")
+    write_log_file(f"会话开始：{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     return path
 
 
@@ -2284,8 +2058,7 @@ def close_log_file() -> None:
     global LOG_FILE
 
     if LOG_FILE is not None:
-        LOG_FILE.write(f"会话结束：{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        LOG_FILE.flush()
+        write_log_file(f"会话结束：{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         LOG_FILE.close()
         LOG_FILE = None
 
@@ -3209,7 +2982,7 @@ def switch_to_full_subscription_node(
     group_names = select_base_switch_groups(
         switch_base_data,
         args,
-        args.url,
+        getattr(args, "_codex_route_url", args.url),
         route_chain=route_chain,
     )
 
@@ -3273,6 +3046,8 @@ def switch_to_full_subscription_node(
             f"({'通过' if probe_ok else '失败'}) - {zh_error(probe_message)}"
         )
         log(green(probe_line) if probe_ok else red(probe_line))
+        if probe_ok is None:
+            raise codex_probe.ProbeError(probe_message, "blocked")
         if not probe_ok:
             continue
 
@@ -3479,6 +3254,9 @@ def switch_to_full_subscription_node(
                 f"{zh_error(str(exc))}"
             ))
             return SwitchOutcome(route_ok=False, rollback_failed=True)
+
+        if ok is None:
+            raise codex_probe.ProbeError(message, "blocked")
 
     log("  跨订阅切换：候选节点基础连通可用，但综合探测或切换复查均未通过")
     return SwitchOutcome(route_ok=False)
@@ -3687,6 +3465,8 @@ def auto_switch_if_needed(
                 f"{', '.join(externally_changed)}"
             )
         log("  自动切换：复查失败，已恢复原策略组选择")
+        if ok is None:
+            raise codex_probe.ProbeError(message, "blocked")
 
     log("  自动切换：候选节点基础连通可用，但没有节点通过综合探测")
     return SwitchOutcome(route_ok=False)
@@ -3930,7 +3710,7 @@ def print_header(
     mode = get_config_value(configs, "mode") or "未知"
 
     log("=" * 88)
-    log(f"{now} | ChatGPT 监控 | 模式={mode}")
+    log(f"{now} | Codex 真实连通性监控 | 模式={mode}")
 
 
 def run_once(
@@ -3969,7 +3749,8 @@ def run_once(
     route_ok: bool | None = None
     if mixed_port:
         route_ok, message = guarded_comprehensive_route_check(args, mixed_port)
-        route_line = f"ChatGPT 路由：{'可用' if route_ok else '失败'} - {zh_error(message)}"
+        route_status = "通过" if route_ok is True else "受阻" if route_ok is None else "失败"
+        route_line = f"{codex_probe.probe_label(args)}：{route_status} - {zh_error(message)}"
         log(route_line if route_ok else red(route_line))
     else:
         log("ChatGPT 路由：跳过 - 未找到 mixed-port；需要时可传 --proxy-port")
@@ -3979,7 +3760,7 @@ def run_once(
     )
 
     rules = fetch_rules(controller)
-    route_chain = current_route_chain(proxies, configs, rules, args.url)
+    route_chain = current_route_chain(proxies, configs, rules, getattr(args, "_codex_route_url", args.url))
     active_source_type = route_source_type(
         route_chain,
         args,
@@ -3996,6 +3777,7 @@ def run_once(
             no_available_chatgpt_node=no_available,
             route_failure_streak=route_failure_streak,
             active_config_path=active_config_path,
+            route_ok=route_ok,
         )
 
     if (
@@ -4009,7 +3791,7 @@ def run_once(
         )
         return finish(True)
 
-    if route_ok is None and not (args.current_only or args.always_test_nodes):
+    if route_ok is None:
         log("无法验证切换结果，本轮不测试或修改节点。")
         return finish(False)
 
@@ -4041,6 +3823,7 @@ def run_once(
             if current_switch_outcome.route_ok is True:
                 active_source_type = "owned"
                 route_failure_streak = 0
+                route_ok = True
                 log(green("当前配置中的可信节点已恢复，已优先切回。"))
                 return finish(False)
             if current_switch_outcome.rollback_failed:
@@ -4075,6 +3858,7 @@ def run_once(
                 if switch_outcome.route_ok is True:
                     active_source_type = "owned"
                     route_failure_streak = 0
+                    route_ok = True
                     active_config_path = (
                         switch_outcome.config_path or active_config_path
                     )
@@ -4098,7 +3882,7 @@ def run_once(
             if free_profiles is not None:
                 free_profiles.close()
                 free_profiles = None
-            log("当前 ChatGPT 路由可用，本轮跳过节点全量测试。")
+            log(f"当前 {codex_probe.probe_label(args)}通过，本轮跳过节点全量测试。")
             return finish(False)
 
     if args.current_only:
@@ -4118,6 +3902,7 @@ def run_once(
                     switch_outcome.source_type or active_source_type
                 )
                 route_failure_streak = 0
+                route_ok = True
                 return finish(False)
             if switch_outcome.rollback_failed:
                 return finish(True)
@@ -4155,6 +3940,7 @@ def run_once(
     if switch_outcome.route_ok is True:
         active_source_type = "owned"
         route_failure_streak = 0
+        route_ok = True
         return finish(False)
     if switch_outcome.rollback_failed:
         return finish(True)
@@ -4195,6 +3981,7 @@ def run_once(
             active_source_type = switch_outcome.source_type
         if switch_outcome.route_ok is True:
             route_failure_streak = 0
+            route_ok = True
             active_config_path = switch_outcome.config_path or active_config_path
             return finish(False)
         if switch_outcome.rollback_failed:
@@ -4216,6 +4003,7 @@ def run_once(
     if switch_outcome.route_ok is True:
         active_source_type = switch_outcome.source_type or "unknown"
         route_failure_streak = 0
+        route_ok = True
         return finish(False)
     if switch_outcome.rollback_failed:
         return finish(True)
@@ -4242,6 +4030,7 @@ def run_once(
             active_source_type = switch_outcome.source_type
         if switch_outcome.route_ok is True:
             route_failure_streak = 0
+            route_ok = True
             active_config_path = switch_outcome.config_path or active_config_path
             return finish(False)
         if switch_outcome.rollback_failed:
@@ -4265,6 +4054,7 @@ def run_once(
     if switch_outcome.route_ok is True:
         active_source_type = "free"
         route_failure_streak = 0
+        route_ok = True
         return finish(False)
     if switch_outcome.rollback_failed:
         return finish(True)
@@ -4300,6 +4090,7 @@ def run_once(
             active_source_type = switch_outcome.source_type
         if switch_outcome.route_ok is True:
             route_failure_streak = 0
+            route_ok = True
             active_config_path = switch_outcome.config_path or active_config_path
             return finish(False)
         if switch_outcome.rollback_failed:
@@ -4308,6 +4099,7 @@ def run_once(
             log("  免费备用切换：发现可用节点，但切换后当前 ChatGPT 路由仍不可用")
 
     return finish(True)
+
 
 
 def positive_int(value: str) -> int:
@@ -4405,28 +4197,32 @@ def parse_args() -> argparse.Namespace:
         help="等待临时全订阅核心启动的秒数",
     )
     parser.add_argument("--url", default=DEFAULT_TEST_URL, help="连通性测试地址")
-    parser.add_argument("--openai-api-url", default=DEFAULT_OPENAI_API_URL, help="OpenAI API HTTPS 预检地址")
-    parser.add_argument("--openai-sse-url", default=DEFAULT_OPENAI_SSE_URL, help="OpenAI SSE 预检/严格探测地址")
-    parser.add_argument("--openai-websocket-url", default=DEFAULT_OPENAI_WEBSOCKET_URL, help="OpenAI WebSocket 预检/严格探测地址")
+    parser.add_argument("--codex-auth-mode", choices=("auto", "chatgpt", "api-key"), default="auto", help="默认优先使用本机 Codex 登录，未登录时读取 API Key")
+    parser.add_argument("--codex-auth-file", help="Codex auth.json 路径；只读，不刷新或写回凭据")
+    parser.add_argument("--probe-mode", choices=("network", "generation"), default="network", help="默认 network：鉴权/API/WS ping-pong，无模型生成；generation：真实 SSE 和 WS 生成")
+    parser.add_argument("--stream-timeout", type=positive_int, default=45, help="每项真实 API/SSE/WS 探测的总时限秒数")
+    parser.add_argument("--openai-api-url", help="真实模型列表接口；默认按 Codex 认证方式选择官方后端")
+    parser.add_argument("--openai-sse-url", help="真实 SSE 接口；默认按 Codex 认证方式选择官方后端")
+    parser.add_argument("--openai-websocket-url", help="真实 WebSocket 接口；默认按 Codex 认证方式选择官方后端")
     parser.add_argument(
         "--openai-stream-model",
-        default=os.getenv("OPENAI_STREAM_TEST_MODEL", DEFAULT_OPENAI_STREAM_MODEL),
-        help="严格 SSE 探测使用的模型；也可用 OPENAI_STREAM_TEST_MODEL 设置",
+        default=os.getenv("OPENAI_STREAM_TEST_MODEL"),
+        help="generation 模式的模型；必须显式选择，避免自动使用桌面端的昂贵模型",
     )
     parser.add_argument(
         "--openai-api-key-env",
         default="OPENAI_API_KEY",
-        help="严格 SSE/WebSocket 探测读取的 API Key 环境变量名",
+        help="API Key 登录模式读取的环境变量名",
     )
     parser.add_argument(
         "--strict-stream-probes",
         action="store_true",
-        help="要求真实 SSE 首事件和 WebSocket 101；需要设置对应 API Key，可能产生极少量 API 调用",
+        help="兼容参数，等同 --probe-mode generation；需要显式指定探测模型",
     )
-    parser.add_argument("--quick-route-only", action="store_true", help="只做原 HTTP 路由探测，跳过 API/SSE/WebSocket 综合探测")
-    parser.add_argument("--skip-api-probe", action="store_true", help="综合探测时跳过 OpenAI API HTTPS 预检")
-    parser.add_argument("--skip-sse-probe", action="store_true", help="综合探测时跳过 SSE 预检")
-    parser.add_argument("--skip-websocket-probe", action="store_true", help="综合探测时跳过 WebSocket 预检")
+    parser.add_argument("--quick-route-only", action="store_true", help="已停用；传入时报告配置错误，不能绕过真实验证")
+    parser.add_argument("--skip-api-probe", action="store_true", help="已停用；不能绕过真实 API 验证")
+    parser.add_argument("--skip-sse-probe", action="store_true", help="已停用；不能绕过真实 SSE 验证")
+    parser.add_argument("--skip-websocket-probe", action="store_true", help="已停用；不能绕过真实 WebSocket 验证")
     parser.add_argument(
         "--deep-probe-fast-ms",
         type=nonnegative_int,
@@ -4518,7 +4314,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--free-abandon-threshold", type=positive_int, default=5, help="免费源连续失败提醒阈值")
     parser.add_argument("--clear", action="store_true", help="每次刷新前清屏")
     parser.add_argument("--once", action="store_true", help="只检查一次后退出")
-    parser.add_argument("--log-file", help="日志文件路径；默认写入当前目录")
+    parser.add_argument("--log-file", help="日志文件名或绝对路径；相对路径位于脚本目录的 logs/ 下，默认 clash-monitor.log；每份 5 MiB，保留 5 份备份")
     parser.add_argument("--no-log-file", action="store_true", help="不写入日志文件")
     return parser.parse_args()
 
@@ -4549,6 +4345,7 @@ def main() -> int:
     active_config_path = ""
 
     stop = False
+    exit_code = 0
 
     def handle_signal(_signum: int, _frame: Any) -> None:
         nonlocal stop
@@ -4582,8 +4379,14 @@ def main() -> int:
                 route_failure_streak = outcome.route_failure_streak
                 active_config_path = outcome.active_config_path
                 fast_retry = outcome.no_available_chatgpt_node
+                exit_code = 0 if outcome.route_ok is True else 5 if outcome.route_ok is None else 1
+            except codex_probe.ProbeError as exc:
+                exit_code = 5
+                log(f"{codex_probe.probe_label(args)}受阻：{exc}")
+                log("已停止本轮节点切换，下一周期重新读取登录状态。")
             except ApiError as exc:
                 log("=" * 88)
+                exit_code = 2
                 log(f"控制接口错误：{zh_error(str(exc))}")
                 try:
                     refreshed_hints = [
@@ -4605,11 +4408,13 @@ def main() -> int:
                 fast_retry = True
             except ProfileError as exc:
                 log("=" * 88)
+                exit_code = 3
                 log(f"全订阅检查错误：{zh_error(str(exc))}")
                 log("将在下个检查周期重试。")
                 fast_retry = True
             except Exception as exc:  # Keep the monitor alive for transient local issues.
                 log("=" * 88)
+                exit_code = 5
                 log(f"意外错误：{zh_error(str(exc))}")
                 log("将在下个检查周期重试。")
 
@@ -4630,7 +4435,7 @@ def main() -> int:
             free_profiles.close()
         close_log_file()
 
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
