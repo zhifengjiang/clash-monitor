@@ -15,6 +15,7 @@
 
 - 自动发现 Clash Verge / Mihomo 控制接口。
 - 默认 `network` 模式：真实鉴权、模型列表 HTTP 200、WebSocket 101 握手校验和随机 ping/pong 往返。只发送网络请求和控制帧，不触发模型推理，不使用生成 token。
+- ChatGPT 登录模式额外访问真实网页首页；即使 `/cdn-cgi/trace` 返回 200，也会显示首页是否被 Cloudflare challenge 拦截。该网页层挑战不参与节点淘汰，最终仍以真实鉴权 API 和 WebSocket 探测决定是否切换，避免所有节点被反复轮换。
 - 可选 `generation` 模式：SSE、WebSocket 都要收到正确文本及 `response.completed` 才通过。生成模型必须显式选择，不自动继承桌面端模型。
 - 400/401、只有首事件或只有 101 握手，均不算对应模式的完整验证成功。
 - 默认读取本机 Codex 的 ChatGPT 登录；API Key 登录时自动改用 OpenAI API 后端。

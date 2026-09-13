@@ -8,6 +8,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from email.message import Message
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -396,6 +397,34 @@ class HttpAndPolicyTests(Offline):
             ok, _ = m.comprehensive_route_check(self.args(), 7897, attempts=1)
         self.assertIs(ok, False)
         self.assertEqual(3, run.call_count)
+
+    def test_cloudflare_challenge_is_reported_as_web_block(self):
+        headers = Message()
+        headers["cf-mitigated"] = "challenge"
+        error = m.HTTPError(m.DEFAULT_CHATGPT_WEB_URL, 403, "Forbidden", headers, None)
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(m, "build_opener", return_value=opener):
+            ok, message, retryable = m.check_via_mixed_proxy_once(
+                m.DEFAULT_CHATGPT_WEB_URL, 7897, 1
+            )
+        self.assertFalse(ok)
+        self.assertFalse(retryable)
+        self.assertIn("Cloudflare challenge", message)
+
+    def test_web_challenge_does_not_cycle_a_healthy_api_route(self):
+        args = self.args()
+        with mock.patch.object(p, "settings", return_value=cfg()), mock.patch.object(
+            m,
+            "check_via_mixed_proxy",
+            side_effect=[
+                (True, "trace 200"),
+                (False, "HTTP 403（Cloudflare challenge，网页被拦截）"),
+            ],
+        ), mock.patch.object(p, "run_step", return_value=(True, "pass")):
+            ok, message = m.comprehensive_route_check(args, 7897, attempts=1)
+        self.assertTrue(ok)
+        self.assertIn("ChatGPT 网页", message)
 
     def test_auth_failure_does_not_retry_or_start_generation(self):
         with mock.patch.object(p, "settings", return_value=cfg()), mock.patch.object(m, "check_via_mixed_proxy", return_value=(True, "200")), mock.patch.object(p, "run_step", return_value=(None, "401")) as run:
