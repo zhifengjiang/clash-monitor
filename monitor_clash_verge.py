@@ -214,6 +214,8 @@ class RunOutcome:
     route_failure_streak: int = 0
     active_config_path: str = ""
     route_ok: bool | None = None
+    log_state: tuple[Any, ...] | None = None
+    had_errors: bool = False
 
 
 @dataclass(frozen=True)
@@ -1844,6 +1846,59 @@ def strict_openai_destination_ok(url: str, scheme: str) -> bool:
 
 
 
+def system_proxy_status(port: int | None, configs: dict[str, Any]) -> tuple[bool, str]:
+    """Inspect effective macOS settings, separately from explicit proxy probes.
+
+    The boolean signals whether this diagnostic needs attention, not whether
+    an application's traffic was observed using the proxy.
+    """
+    if sys.platform != "darwin":
+        return True, "系统代理：未检查（仅支持 macOS）"
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/scutil", "--proxy"], capture_output=True, text=True,
+            timeout=3, check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False, "系统代理：状态未知（读取失败）；显式代理探测不证明应用已接入"
+    # Read only the root dictionary; scoped/supplemental proxies must not
+    # overwrite the effective global settings.
+    values: dict[str, str] = {}
+    depth = 0
+    for line in result.stdout.splitlines():
+        if depth == 1:
+            match = re.fullmatch(r"\s*(\w+)\s*:\s*([^{}]+?)\s*", line)
+            if match:
+                values[match[1]] = match[2]
+        depth += line.count("{") - line.count("}")
+    if "<dictionary>" not in result.stdout:
+        return False, "系统代理：状态未知（无法解析）；显式代理探测不证明应用已接入"
+    details: list[str] = []
+    matches: dict[str, bool] = {}
+    for protocol in ("HTTP", "HTTPS", "SOCKS"):
+        enabled = values.get(protocol + "Enable") == "1"
+        host = values.get(protocol + "Proxy", "")
+        target_port = values.get(protocol + "Port", "")
+        matches[protocol] = enabled and host in {"127.0.0.1", "localhost", "::1"} and port is not None and target_port == str(port)
+        details.append(f"{protocol}=" + ("当前 Clash" if matches[protocol] else "其他地址/端口" if enabled else "关闭"))
+    pac = values.get("ProxyAutoConfigEnable") == "1" or values.get("ProxyAutoDiscoveryEnable") == "1"
+    tun = get_config_value(configs, "tun")
+    tun_enabled = isinstance(tun, dict) and tun.get("enable") is True
+    if pac:
+        status = "需核实（PAC/自动发现已启用，未验证规则是否接入 Clash）"
+        ok = False
+    elif matches["HTTP"] and matches["HTTPS"] and (matches["SOCKS"] or values.get("SOCKSEnable") != "1"):
+        status = "接入配置正常（不代表应用实际流量已验证）"
+        ok = True
+    elif tun_enabled:
+        status = "需通过 TUN 接入（Clash 配置已启用 TUN，未验证实际接管）"
+        ok = True
+    else:
+        status = "警告：未完整接入当前 Clash；请在 Clash Verge 开启系统代理并核对端口"
+        ok = False
+    return ok, f"系统代理：{status}；" + "，".join(details)
+
+
 def comprehensive_route_check(
     args: argparse.Namespace,
     port: int,
@@ -1876,11 +1931,17 @@ def comprehensive_route_check(
                 messages.append(message)
                 if ok is None:
                     return None, "; ".join(messages) + "；本轮停止节点切换"
-        scope = f"模式=生成，模型={cfg.model}" if cfg.mode == "generation" else "模式=网络（鉴权/API/WS 往返，不执行模型生成或 SSE 生成流测试）"
+        if cfg.mode == "generation":
+            scope = f"模式=生成，模型={cfg.model}"
+        elif cfg.credentials.mode == "anonymous":
+            scope = "模式=免登录网络（API/WS 升级入口可达性，不执行鉴权、WS 会话或模型生成验证）"
+        else:
+            scope = "模式=网络（鉴权/API/WS 往返，不执行模型生成或 SSE 生成流测试）"
         message = f"认证={cfg.credentials.mode}，{scope}；" + "; ".join(messages)
         if all(result is True for result in results):
-            suffix = f"（第 {attempt}/{max_attempts} 次成功）" if attempt > 1 else ""
+            suffix = f"（第 {attempt}/{max_attempts} 次成功；此前失败：{failures[-1]}）" if attempt > 1 else ""
             return True, message + suffix
+        args._route_probe_had_errors = True
         failures.append(message)
         if attempt < max_attempts and args.route_retry_delay > 0:
             time.sleep(args.route_retry_delay)
@@ -1893,12 +1954,20 @@ def guarded_comprehensive_route_check(
     port: int,
     attempts: int | None = None,
 ) -> tuple[bool | None, str]:
+    args._route_probe_had_errors = False
     try:
-        return comprehensive_route_check(args, port, attempts=attempts)
+        result = comprehensive_route_check(args, port, attempts=attempts)
     except Exception as exc:
         # Internal/configuration errors must not cycle through every proxy node.
         # Avoid logging exception bodies that could contain credentials.
-        return None, f"Codex 真实验证异常（{type(exc).__name__}）；本轮停止节点切换"
+        result = (None, f"Codex 真实验证异常（{type(exc).__name__}）；本轮停止节点切换")
+    # Keep failures from earlier probes even if a later retry or switch succeeds.
+    args._round_probe_had_errors = (
+        getattr(args, "_round_probe_had_errors", False)
+        or args._route_probe_had_errors
+        or result[0] is not True
+    )
+    return result
 
 
 def advance_route_failure_streak(route_ok: bool | None, current: int) -> int:
@@ -3723,7 +3792,10 @@ def run_once(
     active_source_type: str = "owned",
     route_failure_streak: int = 0,
     active_config_path: str = "",
+    previous_log_state: tuple[Any, ...] | None = None,
 ) -> RunOutcome:
+    args._round_probe_had_errors = False
+    args._route_probe_had_errors = False
     configs_data = api_json(controller, "/configs", timeout=5.0)
     configs = configs_data if isinstance(configs_data, dict) else {}
     proxies_data = api_json(controller, "/proxies", timeout=8.0)
@@ -3745,15 +3817,15 @@ def run_once(
         )
 
     mixed_port = mixed_port_from(args, configs, hints)
-    print_header(controller, version, configs, mixed_port, args.url)
+    system_proxy_ok, system_proxy_line = system_proxy_status(mixed_port, configs)
     route_ok: bool | None = None
     if mixed_port:
         route_ok, message = guarded_comprehensive_route_check(args, mixed_port)
         route_status = "通过" if route_ok is True else "受阻" if route_ok is None else "失败"
         route_line = f"{codex_probe.probe_label(args)}：{route_status} - {zh_error(message)}"
-        log(route_line if route_ok else red(route_line))
     else:
-        log("ChatGPT 路由：跳过 - 未找到 mixed-port；需要时可传 --proxy-port")
+        route_line = "ChatGPT 路由：跳过 - 未找到 mixed-port；需要时可传 --proxy-port"
+    route_had_errors = route_ok is not True or args._route_probe_had_errors or not system_proxy_ok
     route_failure_streak = advance_route_failure_streak(
         route_ok,
         route_failure_streak,
@@ -3766,8 +3838,26 @@ def run_once(
         args,
         trusted_names=trusted_base_names,
     )
-    log(f"当前路径：{format_route_chain(route_chain)}")
-    log()
+    log_state = (
+        route_ok, controller.label, get_config_value(configs, "mode"), mixed_port,
+        tuple(route_chain), active_source_type, active_config_path,
+        codex_probe.probe_label(args),
+        system_proxy_line,
+    )
+    state_changed = previous_log_state is not None and previous_log_state != log_state
+    compact_log = (
+        not route_had_errors
+        and not args.always_test_nodes
+        and not (should_recover_trusted_route(active_source_type, args) and not args.current_only)
+    )
+    if not compact_log:
+        print_header(controller, version, configs, mixed_port, args.url)
+        if state_changed:
+            log("监控状态已变化，输出本轮详情。")
+        log(route_line if route_ok else red(route_line))
+        log(system_proxy_line if system_proxy_ok else red(system_proxy_line))
+        log(f"当前路径：{format_route_chain(route_chain)}")
+        log()
 
     def finish(no_available: bool) -> RunOutcome:
         return RunOutcome(
@@ -3778,6 +3868,11 @@ def run_once(
             route_failure_streak=route_failure_streak,
             active_config_path=active_config_path,
             route_ok=route_ok,
+            log_state=log_state,
+            had_errors=(
+                route_had_errors or args._round_probe_had_errors
+                or route_ok is not True or no_available
+            ),
         )
 
     if (
@@ -3882,7 +3977,12 @@ def run_once(
             if free_profiles is not None:
                 free_profiles.close()
                 free_profiles = None
-            log(f"当前 {codex_probe.probe_label(args)}通过，本轮跳过节点全量测试。")
+            if compact_log:
+                log(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} | "
+                    f"{codex_probe.probe_label(args)}：通过",
+                    flush=True,
+                )
             return finish(False)
 
     if args.current_only:
@@ -4123,36 +4223,25 @@ def nonnegative_float(value: str) -> float:
     return number
 
 
-def wait_with_countdown(seconds: float, should_stop: Callable[[], bool]) -> None:
-    if seconds <= 0:
-        return
+def next_check_interval(
+    current_interval: int | None,
+    args: argparse.Namespace,
+    *,
+    had_errors: bool,
+) -> int:
+    if current_interval is None or had_errors:
+        return min(args.retry_interval, args.interval)
+    return min(current_interval + args.interval_step, args.interval)
 
-    log()
-    if not sys.stdout.isatty():
-        log(f"下次检查：{int(seconds)} 秒后。按 Ctrl+C 停止。")
-        while seconds > 0 and not should_stop():
-            step = min(1.0, seconds)
-            time.sleep(step)
-            seconds -= step
-        return
 
+def wait_for_next_check(seconds: float, should_stop: Callable[[], bool]) -> None:
+    """Wait quietly and remain responsive to stop signals."""
     deadline = time.monotonic() + seconds
-    last_displayed: int | None = None
     while not should_stop():
         remaining = max(0.0, deadline - time.monotonic())
-        displayed = int(remaining + 0.999)
-        if displayed != last_displayed:
-            sys.stdout.write(
-                f"\r下次检查：{displayed:>3} 秒后。按 Ctrl+C 停止。"
-            )
-            sys.stdout.flush()
-            last_displayed = displayed
         if remaining <= 0:
             break
         time.sleep(min(0.2, remaining))
-
-    sys.stdout.write("\r" + " " * 64 + "\r")
-    sys.stdout.flush()
 
 
 def parse_args() -> argparse.Namespace:
@@ -4169,8 +4258,9 @@ def parse_args() -> argparse.Namespace:
         help="节点注入时使用的本地基础配置；默认使用 Clash Verge 的 clash-verge.yaml",
     )
     parser.add_argument("--proxy-port", type=positive_int, help="用于当前路由探测的 mixed-port")
-    parser.add_argument("--interval", type=positive_int, default=60, help="检查间隔秒数")
-    parser.add_argument("--retry-interval", type=positive_int, default=30, help="没有可用 ChatGPT 节点时的快速复查间隔秒数")
+    parser.add_argument("--interval", type=positive_int, default=300, help="检查间隔上限秒数，默认 300（5 分钟）")
+    parser.add_argument("--retry-interval", type=positive_int, default=30, help="启动及出错后重置的检查间隔秒数，默认 30，不超过 --interval")
+    parser.add_argument("--interval-step", type=positive_int, default=30, help="每轮无错误检查后增加的间隔秒数，默认 30")
     parser.add_argument("--timeout", type=positive_int, default=5000, help="节点延迟测试超时时间，单位毫秒")
     parser.add_argument(
         "--route-retries",
@@ -4197,13 +4287,13 @@ def parse_args() -> argparse.Namespace:
         help="等待临时全订阅核心启动的秒数",
     )
     parser.add_argument("--url", default=DEFAULT_TEST_URL, help="连通性测试地址")
-    parser.add_argument("--codex-auth-mode", choices=("auto", "chatgpt", "api-key"), default="auto", help="默认优先使用本机 Codex 登录，未登录时读取 API Key")
-    parser.add_argument("--codex-auth-file", help="Codex auth.json 路径；只读，不刷新或写回凭据")
-    parser.add_argument("--probe-mode", choices=("network", "generation"), default="network", help="默认 network：鉴权/API/WS ping-pong，无模型生成；generation：真实 SSE 和 WS 生成")
+    parser.add_argument("--codex-auth-mode", choices=("auto", "none", "chatgpt", "api-key"), default="auto", help="auto：network 免登录，generation 自动读取凭据；none：免登录；chatgpt/api-key：显式鉴权")
+    parser.add_argument("--codex-auth-file", help="显式鉴权/生成验证使用的 Codex auth.json 路径；默认免登录测试不读取")
+    parser.add_argument("--probe-mode", choices=("network", "generation"), default="network", help="默认 network：免登录检查 API/WS 入口；显式鉴权时验证 WS ping-pong；generation：真实 SSE 和 WS 生成")
     parser.add_argument("--stream-timeout", type=positive_int, default=45, help="每项真实 API/SSE/WS 探测的总时限秒数")
-    parser.add_argument("--openai-api-url", help="真实模型列表接口；默认按 Codex 认证方式选择官方后端")
-    parser.add_argument("--openai-sse-url", help="真实 SSE 接口；默认按 Codex 认证方式选择官方后端")
-    parser.add_argument("--openai-websocket-url", help="真实 WebSocket 接口；默认按 Codex 认证方式选择官方后端")
+    parser.add_argument("--openai-api-url", help="模型接口；免登录时默认 Codex 官方后端，显式鉴权时按认证方式选择")
+    parser.add_argument("--openai-sse-url", help="SSE 接口；免登录时仅用于路由识别，生成模式才发送请求")
+    parser.add_argument("--openai-websocket-url", help="WebSocket 接口；免登录时检查升级请求的认证响应")
     parser.add_argument(
         "--openai-stream-model",
         default=os.getenv("OPENAI_STREAM_TEST_MODEL"),
@@ -4343,6 +4433,15 @@ def main() -> int:
     active_source_type = "owned"
     route_failure_streak = 0
     active_config_path = ""
+    previous_log_state: tuple[Any, ...] | None = None
+    current_interval: int | None = None
+
+    if not args.once:
+        log(
+            f"检查间隔：从 {min(args.retry_interval, args.interval)} 秒开始，"
+            f"每轮无错误后增加 {args.interval_step} 秒，上限 {args.interval} 秒；"
+            "出错后重置并重新递增。"
+        )
 
     stop = False
     exit_code = 0
@@ -4357,7 +4456,7 @@ def main() -> int:
     try:
         while not stop:
             started = time.monotonic()
-            fast_retry = False
+            round_had_errors = True
             if args.clear:
                 sys.stdout.write("\033[2J\033[H")
                 sys.stdout.flush()
@@ -4372,19 +4471,26 @@ def main() -> int:
                     active_source_type=active_source_type,
                     route_failure_streak=route_failure_streak,
                     active_config_path=active_config_path,
+                    previous_log_state=previous_log_state,
                 )
                 owned_profiles = outcome.owned_profiles
                 free_profiles = outcome.free_profiles
                 active_source_type = outcome.active_source_type or active_source_type
                 route_failure_streak = outcome.route_failure_streak
                 active_config_path = outcome.active_config_path
-                fast_retry = outcome.no_available_chatgpt_node
+                previous_log_state = outcome.log_state
+                round_had_errors = (
+                    outcome.had_errors or outcome.no_available_chatgpt_node
+                    or outcome.route_ok is not True
+                )
                 exit_code = 0 if outcome.route_ok is True else 5 if outcome.route_ok is None else 1
             except codex_probe.ProbeError as exc:
+                previous_log_state = (None,)
                 exit_code = 5
                 log(f"{codex_probe.probe_label(args)}受阻：{exc}")
-                log("已停止本轮节点切换，下一周期重新读取登录状态。")
+                log("已停止本轮节点切换，下一周期重新检查探测条件。")
             except ApiError as exc:
+                previous_log_state = (None,)
                 log("=" * 88)
                 exit_code = 2
                 log(f"控制接口错误：{zh_error(str(exc))}")
@@ -4405,14 +4511,14 @@ def main() -> int:
                         "控制接口重新发现失败，将在下个检查周期重试："
                         f"{zh_error(str(rediscover_exc))}"
                     )
-                fast_retry = True
             except ProfileError as exc:
+                previous_log_state = (None,)
                 log("=" * 88)
                 exit_code = 3
                 log(f"全订阅检查错误：{zh_error(str(exc))}")
                 log("将在下个检查周期重试。")
-                fast_retry = True
             except Exception as exc:  # Keep the monitor alive for transient local issues.
+                previous_log_state = (None,)
                 log("=" * 88)
                 exit_code = 5
                 log(f"意外错误：{zh_error(str(exc))}")
@@ -4422,11 +4528,13 @@ def main() -> int:
                 break
 
             elapsed = time.monotonic() - started
-            next_interval = args.retry_interval if fast_retry else args.interval
-            if fast_retry:
-                log(f"未发现可用 ChatGPT 节点，启用快速复查间隔：{next_interval} 秒。")
-            sleep_for = max(0.0, next_interval - elapsed)
-            wait_with_countdown(sleep_for, lambda: stop)
+            current_interval = next_check_interval(
+                current_interval, args, had_errors=round_had_errors,
+            )
+            if round_had_errors:
+                log(f"本轮检查出现错误或未通过，复查间隔重置为 {current_interval} 秒。")
+            sleep_for = max(0.0, current_interval - elapsed)
+            wait_for_next_check(sleep_for, lambda: stop)
     finally:
         log("已停止。")
         if owned_profiles:

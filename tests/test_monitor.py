@@ -94,6 +94,7 @@ class OfflineTestCase(unittest.TestCase):
             return fail
 
         patchers = [
+            mock.patch.object(monitor, "system_proxy_status", return_value=(True, "系统代理：接入配置正常")),
             mock.patch.object(monitor, "log", return_value=None),
             mock.patch.object(monitor, "api_json", side_effect=forbidden("Clash API access")),
             mock.patch.object(monitor, "urlopen", side_effect=forbidden("network access")),

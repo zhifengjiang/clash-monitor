@@ -1,6 +1,7 @@
 """Codex connectivity checks without desktop automation.
 
-Default: authenticated HTTPS plus WebSocket handshake and ping/pong, no generation.
+Default: anonymous HTTPS and WebSocket upgrade endpoint reachability, no login.
+Explicit authentication adds model listing and WebSocket handshake/ping-pong.
 Opt-in generation: both streaming transports must return text and response.completed.
 """
 from __future__ import annotations
@@ -36,17 +37,18 @@ class ProbeError(Exception):
 @dataclass(frozen=True)
 class Credentials:
     mode: str
-    token: str = field(repr=False)
+    token: str = field(default="", repr=False)
     account_id: str = field(default="", repr=False)
 
     def headers(self) -> dict[str, str]:
         values = {
-            "Authorization": f"Bearer {self.token}",
             "User-Agent": f"codex_cli_rs/{CLIENT_VERSION}",
             "originator": "codex_cli_rs",
         }
-        if self.account_id:
-            values["ChatGPT-Account-Id"] = self.account_id
+        if self.mode != "anonymous":
+            values["Authorization"] = f"Bearer {self.token}"
+            if self.account_id:
+                values["ChatGPT-Account-Id"] = self.account_id
         if any("\r" in v or "\n" in v or not v.isascii() for v in values.values()):
             raise ProbeError("登录凭据包含无效字符", "auth")
         return values
@@ -152,8 +154,8 @@ def validate_provider(credentials: Credentials) -> None:
 def validate_destination(url: str, credentials: Credentials, scheme: str) -> None:
     try:
         parsed = urlparse(url)
-        host = "chatgpt.com" if credentials.mode == "chatgpt" else "api.openai.com"
-        prefix = "/backend-api/codex/" if credentials.mode == "chatgpt" else "/v1/"
+        host = "api.openai.com" if credentials.mode == "api-key" else "chatgpt.com"
+        prefix = "/v1/" if credentials.mode == "api-key" else "/backend-api/codex/"
         valid = (parsed.scheme == scheme and parsed.hostname == host
                  and parsed.port in (None, 443) and not parsed.username and not parsed.password
                  and parsed.path.startswith(prefix) and not parsed.fragment
@@ -180,21 +182,34 @@ def probe_mode(args: Any) -> str:
 
 
 def probe_label(args: Any) -> str:
-    return "Codex 生成验证" if probe_mode(args) == "generation" else "Codex 网络/协议验证"
+    if probe_mode(args) == "generation":
+        return "Codex 生成验证"
+    return "Codex 免登录连通性验证" if anonymous_network(args) else "Codex 网络/协议验证"
+
+
+def anonymous_network(args: Any) -> bool:
+    return probe_mode(args) == "network" and getattr(args, "codex_auth_mode", "auto") in ("auto", "none")
 
 
 def settings(args: Any) -> Settings:
-    credentials = load_credentials(args)
-    validate_provider(credentials)
-    base = "https://chatgpt.com/backend-api/codex" if credentials.mode == "chatgpt" else "https://api.openai.com/v1"
     mode = probe_mode(args)
+    if anonymous_network(args):
+        # Network monitoring targets the official Codex endpoints independently
+        # of desktop installation, saved login, API keys or provider settings.
+        credentials = Credentials("anonymous")
+    else:
+        if getattr(args, "codex_auth_mode", "auto") == "none":
+            raise ProbeError("生成验证需要凭据；免登录测试请使用 --probe-mode network", "config")
+        credentials = load_credentials(args)
+        validate_provider(credentials)
+    base = "https://api.openai.com/v1" if credentials.mode == "api-key" else "https://chatgpt.com/backend-api/codex"
     model = getattr(args, "openai_stream_model", None) or ""
     if mode == "generation" and not model:
         raise ProbeError("生成验证请显式指定 --openai-stream-model；网络模式无需模型", "config")
     if any(getattr(args, key, False) for key in ("quick_route_only", "skip_api_probe", "skip_sse_probe", "skip_websocket_probe")):
         raise ProbeError("请用 --probe-mode 选择验证范围，移除旧 quick/skip 探测参数", "config")
     api_url = getattr(args, "openai_api_url", None) or base + "/models"
-    if credentials.mode == "chatgpt" and not getattr(args, "openai_api_url", None):
+    if credentials.mode != "api-key" and not getattr(args, "openai_api_url", None):
         api_url += "?client_version=" + CLIENT_VERSION
     sse_url = getattr(args, "openai_sse_url", None) or base + "/responses"
     ws_url = getattr(args, "openai_websocket_url", None) or "wss" + base[5:] + "/responses"
@@ -231,7 +246,8 @@ def http_error(status: int) -> ProbeError:
     return ProbeError(f"HTTP {status}（请求失败）", kind)
 
 
-def open_http(url: str, port: int, cfg: Settings, deadline: Deadline, payload: dict[str, Any] | None = None) -> tuple[Any, Any, Any]:
+def open_http(url: str, port: int, cfg: Settings, deadline: Deadline, payload: dict[str, Any] | None = None,
+              *, expected_statuses: tuple[int, ...] = (200,), extra_headers: dict[str, str] | None = None) -> tuple[Any, Any, Any]:
     validate_destination(url, cfg.credentials, "https")
     parsed = urlparse(url)
     conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=deadline.remaining(), context=tls_context())
@@ -240,6 +256,7 @@ def open_http(url: str, port: int, cfg: Settings, deadline: Deadline, payload: d
     headers["Accept"] = "text/event-stream" if payload is not None else "application/json"
     headers["Accept-Encoding"] = "identity"
     headers["Content-Type"] = "application/json"
+    headers.update(extra_headers or {})
     path = parsed.path + ("?" + parsed.query if parsed.query else "")
     try:
         conn.connect()
@@ -249,7 +266,7 @@ def open_http(url: str, port: int, cfg: Settings, deadline: Deadline, payload: d
                      body=json.dumps(payload).encode() if payload is not None else None, headers=headers)
         deadline.arm(sock)
         response = conn.getresponse()
-        if response.status != 200:
+        if response.status not in expected_statuses:
             raise http_error(response.status)
         return conn, response, sock
     except BaseException:
@@ -270,23 +287,48 @@ def http_chunks(response: Any, sock: Any, deadline: Deadline) -> Iterator[bytes]
         yield chunk
 
 
+def read_json_response(response: Any, sock: Any, deadline: Deadline) -> Any:
+    if response.getheader("Content-Type", "").split(";")[0].strip().lower() != "application/json":
+        raise ProbeError("接口未返回 JSON，不能确认后端可达")
+    try:
+        return json.loads(b"".join(http_chunks(response, sock, deadline)))
+    except ValueError:
+        raise ProbeError("接口 JSON 无效") from None
+
+
+def verify_anonymous_challenge(data: Any) -> None:
+    """Only a recognizable JSON auth challenge proves endpoint reachability."""
+    if isinstance(data, dict):
+        detail = data.get("detail")
+        if isinstance(detail, str) and detail.strip().lower() in ("unauthorized", "not authenticated"):
+            return
+        error = data.get("error")
+        if isinstance(error, dict) and (
+            error.get("type") == "authentication_error"
+            or error.get("code") in ("unauthorized", "missing_api_key", "invalid_api_key", "missing_authentication", "missing_bearer_token")
+        ):
+            return
+    raise ProbeError("HTTP 401 未包含可识别的认证响应，不能确认后端可达")
+
+
 def probe_models(cfg: Settings, port: int) -> str:
     deadline = Deadline(cfg.timeout)
-    conn, response, sock = open_http(cfg.api_url, port, cfg, deadline)
+    anonymous = cfg.credentials.mode == "anonymous"
+    conn, response, sock = open_http(cfg.api_url, port, cfg, deadline,
+                                    expected_statuses=(200, 401) if anonymous else (200,))
     try:
-        if response.getheader("Content-Type", "").split(";")[0].strip() != "application/json":
-            raise ProbeError("模型接口未返回 JSON")
-        try:
-            data = json.loads(b"".join(http_chunks(response, sock, deadline)))
-        except ValueError:
-            raise ProbeError("模型接口 JSON 无效") from None
-        key = "models" if cfg.credentials.mode == "chatgpt" else "data"
+        data = read_json_response(response, sock, deadline)
+        if anonymous and response.status == 401:
+            verify_anonymous_challenge(data)
+            return "HTTP 401，已收到预期认证响应，Codex API 入口可达（免登录）"
+        key = "data" if cfg.credentials.mode == "api-key" else "models"
         models = data.get(key) if isinstance(data, dict) else None
         if not isinstance(models, list) or not models:
             raise ProbeError("模型接口没有返回有效模型列表")
         # The authenticated generation below is authoritative for model access;
         # aliases need not be listed under the same name by the catalogue.
-        return f"HTTP 200，真实鉴权成功，收到 {len(models)} 个模型"
+        scope = "免登录入口可达" if anonymous else "真实鉴权成功"
+        return f"HTTP 200，{scope}，收到 {len(models)} 个模型"
     finally:
         response.close()
         conn.close()
@@ -541,6 +583,8 @@ def open_websocket(cfg: Settings, port: int, deadline: Deadline) -> Any:
 
 def probe_websocket_network(cfg: Settings, port: int) -> str:
     """Only RFC 6455 control frames: never send response.create or any text."""
+    if cfg.credentials.mode == "anonymous":
+        return probe_websocket_reachability(cfg, port)
     deadline = Deadline(cfg.timeout)
     sock = open_websocket(cfg, port, deadline)
     try:
@@ -559,6 +603,22 @@ def probe_websocket_network(cfg: Settings, port: int) -> str:
         raise ProbeError("WebSocket 没有返回匹配的 pong")
     finally:
         sock.close()
+
+
+def probe_websocket_reachability(cfg: Settings, port: int) -> str:
+    """Check the real upgrade endpoint's auth response, without claiming a WS session."""
+    validate_destination(cfg.ws_url, cfg.credentials, "wss")
+    deadline = Deadline(cfg.timeout)
+    headers = {"Upgrade": "websocket", "Connection": "Upgrade", "Sec-WebSocket-Version": "13",
+               "Sec-WebSocket-Key": base64.b64encode(os.urandom(16)).decode()}
+    conn, response, sock = open_http("https" + cfg.ws_url[3:], port, cfg, deadline,
+                                    expected_statuses=(401,), extra_headers=headers)
+    try:
+        verify_anonymous_challenge(read_json_response(response, sock, deadline))
+        return "HTTP 401，升级请求已到达 Codex 认证入口（免登录；未建立 WebSocket 会话或验证 ping/pong）"
+    finally:
+        response.close()
+        conn.close()
 
 
 def probe_websocket(cfg: Settings, port: int) -> str:

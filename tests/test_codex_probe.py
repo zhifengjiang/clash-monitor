@@ -150,6 +150,55 @@ class CredentialsTests(Offline):
         self.assertEqual("network", result.mode)
         self.assertEqual("", result.model)
 
+    def test_default_network_works_without_any_credentials(self):
+        result = p.settings(SimpleNamespace())
+        self.assertEqual("network", result.mode)
+        self.assertEqual("anonymous", result.credentials.mode)
+        self.assertEqual("https://chatgpt.com/backend-api/codex/models?client_version=" + p.CLIENT_VERSION, result.api_url)
+        self.assertEqual("wss://chatgpt.com/backend-api/codex/responses", result.ws_url)
+        self.assertNotIn("Authorization", result.credentials.headers())
+        self.assertNotIn("ChatGPT-Account-Id", result.credentials.headers())
+
+    def test_network_ignores_missing_invalid_expired_and_valid_local_auth(self):
+        expired = base64.urlsafe_b64encode(json.dumps({"exp": 1}).encode()).decode()
+        for auth in (None, "invalid-json", json.dumps({"auth_mode": "chatgpt", "tokens": {
+            "access_token": "a." + expired + ".c", "account_id": "account"
+        }}), json.dumps({"OPENAI_API_KEY": "saved-secret"})):
+            path = Path(self.tmp.name) / "auth.json"
+            if auth is not None:
+                path.write_text(auth)
+            (Path(self.tmp.name) / "config.toml").write_text('model_provider = "custom"\n[model_providers.custom]\nbase_url = "https://example.com/v1"\n')
+            with self.subTest(auth=auth), mock.patch.object(p, "load_credentials", side_effect=AssertionError("read login")), mock.patch.object(p, "validate_provider", side_effect=AssertionError("read desktop config")), mock.patch.dict(os.environ, {"OPENAI_API_KEY": "env-secret", "OPENAI_BASE_URL": "https://example.com/v1"}):
+                result = p.settings(self.args(probe_mode="network", codex_auth_file="/unreadable/auth.json"))
+            self.assertEqual("anonymous", result.credentials.mode)
+            self.assertNotIn("Authorization", result.credentials.headers())
+            if auth is not None:
+                self.assertEqual(auth, path.read_text())
+
+    def test_explicit_anonymous_mode_is_network_only(self):
+        self.assertEqual("anonymous", p.settings(self.args(probe_mode="network", codex_auth_mode="none")).credentials.mode)
+        with self.assertRaises(p.ProbeError) as cm:
+            p.settings(self.args(codex_auth_mode="none"))
+        self.assertEqual("config", cm.exception.kind)
+
+    def test_authenticated_network_is_still_explicitly_available(self):
+        with self.assertRaises(p.ProbeError):
+            p.settings(self.args(probe_mode="network", codex_auth_mode="chatgpt"))
+        self.write_auth()
+        self.assertEqual("chatgpt", p.settings(self.args(probe_mode="network", codex_auth_mode="chatgpt")).credentials.mode)
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "api-secret"}):
+            result = p.settings(self.args(probe_mode="network", codex_auth_mode="api-key"))
+        self.assertEqual("https://api.openai.com/v1/models", result.api_url)
+
+    def test_anonymous_requests_cannot_leak_attached_credentials_or_change_host(self):
+        credentials = p.Credentials("anonymous", "unused-secret", "unused-account")
+        self.assertNotIn("Authorization", credentials.headers())
+        self.assertNotIn("ChatGPT-Account-Id", credentials.headers())
+        for url in ("https://example.com/backend-api/codex/models", "https://api.openai.com/v1/models",
+                    "http://chatgpt.com/backend-api/codex/models", "https://chatgpt.com:8443/backend-api/codex/models"):
+            with self.subTest(url=url), self.assertRaises(p.ProbeError):
+                p.validate_destination(url, credentials, "https")
+
     def test_legacy_strict_flag_explicitly_selects_generation(self):
         self.write_auth()
         result = p.settings(self.args(probe_mode="network", strict_stream_probes=True))
@@ -354,6 +403,84 @@ class WebSocketTests(Offline):
         self.assertTrue(sock.closed)
 
 
+class AnonymousNetworkTests(Offline):
+    def exercise(self, probe, *, status=401, body=b'{"detail":"Unauthorized"}', content_type="application/json"):
+        response = mock.Mock(status=status)
+        response.getheader.return_value = content_type
+        response.read1.side_effect = [body, b""]
+        conn = mock.Mock()
+        conn.getresponse.return_value = response
+        with mock.patch.object(p.http.client, "HTTPSConnection", return_value=conn) as connect, mock.patch.dict(os.environ, {"NO_PROXY": "*"}):
+            result = p.run_step("test", probe, p.settings(SimpleNamespace()), 8123)
+        self.assertEqual(("127.0.0.1", 8123), connect.call_args.args)
+        conn.set_tunnel.assert_called_once_with("chatgpt.com", 443)
+        conn.close.assert_called_once()
+        request = conn.request.call_args
+        self.assertEqual("GET", request.args[0])
+        self.assertIsNone(request.kwargs["body"])
+        self.assertNotIn("Authorization", request.kwargs["headers"])
+        self.assertNotIn("ChatGPT-Account-Id", request.kwargs["headers"])
+        return result, request, response
+
+    def test_anonymous_api_auth_challenge_passes_without_login(self):
+        (ok, message), request, response = self.exercise(p.probe_models)
+        self.assertIs(ok, True)
+        self.assertIn("HTTP 401", message)
+        self.assertIn("入口可达", message)
+        self.assertNotIn("鉴权成功", message)
+        self.assertTrue(request.args[1].startswith("/backend-api/codex/models?"))
+        response.close.assert_called_once()
+
+    def test_anonymous_websocket_sends_upgrade_but_claims_only_reachability(self):
+        (ok, message), request, response = self.exercise(p.probe_websocket_network)
+        self.assertIs(ok, True)
+        self.assertEqual("/backend-api/codex/responses", request.args[1])
+        headers = request.kwargs["headers"]
+        self.assertEqual("websocket", headers["Upgrade"])
+        self.assertEqual("Upgrade", headers["Connection"])
+        self.assertEqual("13", headers["Sec-WebSocket-Version"])
+        self.assertEqual(16, len(base64.b64decode(headers["Sec-WebSocket-Key"])))
+        self.assertIn("未建立 WebSocket 会话", message)
+        self.assertNotIn("握手校验通过", message)
+        response.close.assert_called_once()
+
+    def test_html_invalid_json_and_unrecognized_401_never_pass(self):
+        for probe in (p.probe_models, p.probe_websocket_network):
+            for content_type, body in (("text/html", b"<html>Unauthorized</html>"), ("application/json", b"invalid"),
+                                       ("application/json", b"{}"), ("application/json", b'{"error":{"message":"private-secret"}}'),
+                                       ("application/json", b'{"detail":"blocked region"}')):
+                with self.subTest(probe=probe.__name__, body=body):
+                    (ok, message), _, response = self.exercise(probe, content_type=content_type, body=body)
+                self.assertIs(ok, False)
+                self.assertNotIn("private-secret", message)
+                response.close.assert_called_once()
+
+    def test_redirects_blocking_and_server_failures_are_not_auth_challenges(self):
+        for probe in (p.probe_models, p.probe_websocket_network):
+            for status, expected in ((302, False), (400, None), (403, False), (407, False), (404, None), (429, None), (500, None)):
+                with self.subTest(probe=probe.__name__, status=status):
+                    (ok, _), _, _ = self.exercise(probe, status=status)
+                self.assertIs(ok, expected)
+
+    def test_http_200_requires_real_models_and_is_not_websocket_success(self):
+        for body, expected in ((b'{"models":[{"slug":"model"}]}', True), (b"{}", False), (b'{"detail":"Unauthorized"}', False)):
+            with self.subTest(body=body):
+                (ok, message), _, _ = self.exercise(p.probe_models, status=200, body=body)
+            self.assertIs(ok, expected)
+            self.assertNotIn("鉴权成功", message)
+        for status in (101, 200):
+            with self.subTest(status=status):
+                (ok, _), _, _ = self.exercise(p.probe_websocket_network, status=status)
+            self.assertIs(ok, False)
+
+    def test_authenticated_401_is_still_blocked(self):
+        conn = mock.Mock()
+        conn.getresponse.return_value.status = 401
+        with mock.patch.object(p.http.client, "HTTPSConnection", return_value=conn):
+            ok, _ = p.run_step("API", p.probe_models, replace(cfg(), mode="network"), 8123)
+        self.assertIsNone(ok)
+
+
 class HttpAndPolicyTests(Offline):
     def test_http_connect_cannot_bypass_proxy_via_no_proxy_or_redirect(self):
         conn = mock.Mock()
@@ -412,6 +539,35 @@ class HttpAndPolicyTests(Offline):
         self.assertEqual([p.probe_models, p.probe_websocket_network], [call.args[1] for call in run.call_args_list])
         self.assertIn("不执行模型生成", message)
         self.assertNotIn("response.completed", message)
+
+    def test_full_default_pipeline_passes_without_reading_local_credentials(self):
+        args = self.args()
+        connections = []
+        for _ in range(2):
+            conn = mock.Mock()
+            response = conn.getresponse.return_value
+            response.status = 401
+            response.getheader.return_value = "application/json"
+            response.read1.side_effect = [b'{"detail":"Unauthorized"}', b""]
+            connections.append(conn)
+        with mock.patch.object(p, "load_credentials", side_effect=AssertionError("read login")), mock.patch.object(p.http.client, "HTTPSConnection", side_effect=connections), mock.patch.object(m, "check_via_mixed_proxy", return_value=(True, "200")), mock.patch.object(p, "probe_sse", side_effect=AssertionError("generation")), mock.patch.object(p, "probe_websocket", side_effect=AssertionError("generation")):
+            ok, message = m.guarded_comprehensive_route_check(args, 7897, attempts=1)
+        self.assertIs(ok, True)
+        self.assertIn("模式=免登录网络", message)
+        self.assertIn("认证=anonymous", message)
+        self.assertIn("未建立 WebSocket 会话", message)
+        self.assertFalse(args._round_probe_had_errors)
+        self.assertEqual("Codex 免登录连通性验证", p.probe_label(args))
+
+    def test_anonymous_network_failure_still_retries(self):
+        args = self.args()
+        args.route_retry_delay = 0
+        with mock.patch.object(m, "check_via_mixed_proxy", return_value=(True, "200")), mock.patch.object(p.http.client, "HTTPSConnection", side_effect=OSError("offline")) as connect:
+            ok, message = m.guarded_comprehensive_route_check(args, 7897, attempts=2)
+        self.assertIs(ok, False)
+        self.assertEqual(4, connect.call_count)
+        self.assertTrue(args._round_probe_had_errors)
+        self.assertIn("连续 2 次", message)
 
     def test_blocked_route_does_not_test_or_switch_nodes_even_in_current_only_mode(self):
         with mock.patch.object(m, "api_json", side_effect=[{"mixed-port": 7897}, {"proxies": {}}]), mock.patch.object(m, "base_proxy_names_for_args", return_value=set()), mock.patch.object(m, "guarded_comprehensive_route_check", return_value=(None, "401")), mock.patch.object(m, "fetch_rules", return_value=[]), mock.patch.object(m, "log"), mock.patch.object(m, "auto_switch_if_needed") as switch, mock.patch.object(m, "run_delay_checks") as delay:
