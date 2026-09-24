@@ -94,6 +94,8 @@ CLASH_API=http://127.0.0.1:9097 CLASH_SECRET=your-secret ./monitor_clash_verge.p
 ./monitor_clash_verge.py --unix-socket /tmp/verge/verge-mihomo.sock
 ```
 
+Clash Verge 服务模式可能使用 `/var/run/clash-verge-service/users/<UID>/verge-mihomo.sock`，而配置文件仍保留临时目录中的旧路径。脚本会按当前用户 UID 自动发现该服务 socket，无需手动指定路径或启用 HTTP 控制端口；同时兼容上面的旧 socket 路径。
+
 禁用自动切换：
 
 ```bash

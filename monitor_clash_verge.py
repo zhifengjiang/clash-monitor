@@ -1069,7 +1069,10 @@ def build_candidates(args: argparse.Namespace, hints: list[ConfigHint]) -> list[
                 ),
             )
 
-    for socket_path in COMMON_UNIX_SOCKETS:
+    # Service mode overrides the YAML socket via -ext-ctl-unix; the file can
+    # still point at a socket in the user's temporary directory that is absent.
+    service_socket = f"/var/run/clash-verge-service/users/{os.getuid()}/verge-mihomo.sock"
+    for socket_path in (service_socket, *COMMON_UNIX_SOCKETS):
         if is_safe_unix_socket(socket_path):
             for secret in deduped_secrets:
                 add_candidate(
