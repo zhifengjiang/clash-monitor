@@ -18,6 +18,7 @@
 - 系统代理异常时输出诊断明细，正常时不重复列出各协议设置；`--once` 退出码仍表示显式代理的所选验证范围，系统代理设置正常也不能证明桌面应用实际采用了它。
 - 默认 `network` 模式：通过代理建立 TLS，匿名访问 Codex 模型接口和 WebSocket 升级入口。识别预期的 HTTP 401 JSON 认证响应，证明入口可达；不读取本地 Codex 凭据或 provider 配置，不触发模型推理，不使用生成 token。
 - 可选显式鉴权网络测试：通过 `--codex-auth-mode chatgpt` 或 `api-key` 验证真实鉴权、模型列表 HTTP 200、WebSocket 101 握手及随机 ping/pong 往返。
+- ChatGPT 登录模式额外访问真实网页首页；即使 `/cdn-cgi/trace` 返回 200，也会显示首页是否被 Cloudflare challenge 拦截。该网页层挑战不参与节点淘汰，最终仍以真实鉴权 API 和 WebSocket 探测决定是否切换，避免所有节点被反复轮换。
 - 可选 `generation` 模式：SSE、WebSocket 都要收到正确文本及 `response.completed` 才通过。生成模型必须显式选择，不自动继承桌面端模型。
 - 匿名测试中的预期 401 只证明后端入口可达，不代表登录、WebSocket 会话或生成成功。HTML 挑战页、无法识别的 401、403、重定向及服务端故障均不会误报通过；显式鉴权/生成测试中的 401 仍报告受阻。
 - 默认测试固定使用 Codex 官方后端，与本地登录、API Key 和自定义 provider 无关。显式选择 API Key 鉴权时使用 OpenAI API 后端。

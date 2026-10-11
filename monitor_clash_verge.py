@@ -48,6 +48,10 @@ import codex_probe
 
 
 DEFAULT_TEST_URL = "https://chatgpt.com/cdn-cgi/trace"
+# The trace endpoint only proves that the CDN can be reached.  It can still
+# return 200 while the actual ChatGPT web application is blocked by a
+# Cloudflare challenge (the browser then shows "Unable to load site").
+DEFAULT_CHATGPT_WEB_URL = "https://chatgpt.com/"
 DEFAULT_EXCLUDE_REGEX = r"香港|港|🇭🇰|Hong\s*Kong|HongKong|\bHKG\b|\bHK(?:\b|[0-9_-])"
 DEFAULT_SKIP_CANDIDATE_REGEX = r"剩余流量|套餐到期|距离下次重置|Traffic|Expire|Reset"
 DEFAULT_FREE_SUBSCRIPTION_URLS = (
@@ -1793,11 +1797,14 @@ def check_via_mixed_proxy_once(url: str, port: int, timeout_s: float) -> tuple[b
                 False,
             )
         retryable = exc.code in {408, 429} or 500 <= exc.code < 600
-        return (
-            False,
-            f"HTTP {exc.code}, {elapsed_ms} 毫秒",
-            retryable,
-        )
+        detail = f"HTTP {exc.code}, {elapsed_ms} 毫秒"
+        # Make proxy/CDN blocking explicit.  A 403 challenge is not a
+        # transient transport failure and must not be treated as a healthy
+        # route merely because /cdn-cgi/trace succeeded.
+        headers = exc.headers or {}
+        if exc.code == 403 and str(headers.get("cf-mitigated", "")).lower() == "challenge":
+            detail += "（Cloudflare challenge，网页被拦截）"
+        return (False, detail, retryable)
     except (OSError, URLError) as exc:
         return False, str(exc), True
 
@@ -1831,6 +1838,16 @@ def check_via_mixed_proxy(
         return False, failures[-1]
     recent = "; ".join(failures[-3:])
     return False, f"{failures[-1]}（连续 {len(failures)} 次失败；最近错误：{recent}）"
+
+
+def is_cloudflare_web_challenge(message: str) -> bool:
+    """Return whether a web-page probe was blocked by a CDN challenge.
+
+    This is a browser-layer signal, not proof that the ChatGPT API route is
+    unusable.  Providers can challenge every exit IP (including otherwise
+    healthy API/WebSocket routes), so it must not trigger node cycling.
+    """
+    return "Cloudflare challenge" in message or "网页被拦截" in message
 
 
 def strict_openai_destination_ok(url: str, scheme: str) -> bool:
@@ -1923,6 +1940,23 @@ def comprehensive_route_check(
         messages = [f"HTTP 基础连接：{http_message}"]
         results: list[bool | None] = [http_ok]
         if http_ok:
+            # /cdn-cgi/trace is deliberately cheap, but it is insufficient:
+            # Cloudflare may allow the trace and API while denying the real
+            # browser page.  Check the page itself for ChatGPT-auth routes so
+            # the monitor agrees with what the user sees in Chrome.
+            if cfg.credentials.mode == "chatgpt":
+                web_ok, web_message = check_via_mixed_proxy(
+                    DEFAULT_CHATGPT_WEB_URL,
+                    port,
+                    timeout_s=timeout_s,
+                    attempts=1,
+                )
+                messages.append(f"ChatGPT 网页：{web_message}")
+                # A CDN/browser challenge is non-actionable for node
+                # selection.  Keep it visible, but let the authenticated API
+                # and WebSocket probes decide whether the route is usable.
+                if web_ok or not is_cloudflare_web_challenge(web_message):
+                    results.append(web_ok)
             probes = [("API", codex_probe.probe_models)]
             if cfg.mode == "generation":
                 probes.extend([("SSE", codex_probe.probe_sse), ("WebSocket", codex_probe.probe_websocket)])
@@ -2150,12 +2184,24 @@ def run_delay_checks(
     targets: list[NodeTarget],
     args: argparse.Namespace,
 ) -> list[DelayResult]:
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = [
-            executor.submit(test_delay, controller, target, args.url, args.timeout)
-            for target in targets
-        ]
-        return [future.result() for future in concurrent.futures.as_completed(futures)]
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
+    futures = [
+        executor.submit(test_delay, controller, target, args.url, args.timeout)
+        for target in targets
+    ]
+    try:
+        results = [future.result() for future in concurrent.futures.as_completed(futures)]
+    except KeyboardInterrupt:
+        # Do not wait for every in-flight node timeout after Ctrl+C.  Running
+        # worker threads are daemon-managed by the interpreter and will end
+        # with the process; queued work can be cancelled immediately.
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+        return results
 
 
 def matches_regex(pattern: str, text: str) -> bool:
@@ -4451,6 +4497,8 @@ def main() -> int:
 
     def handle_signal(_signum: int, _frame: Any) -> None:
         nonlocal stop
+        if _signum == signal.SIGINT:
+            raise KeyboardInterrupt
         stop = True
 
     signal.signal(signal.SIGINT, handle_signal)
@@ -4538,6 +4586,9 @@ def main() -> int:
                 log(f"本轮检查出现错误或未通过，复查间隔重置为 {current_interval} 秒。")
             sleep_for = max(0.0, current_interval - elapsed)
             wait_for_next_check(sleep_for, lambda: stop)
+    except KeyboardInterrupt:
+        exit_code = 130
+        log("收到退出信号，正在停止监控。")
     finally:
         log("已停止。")
         if owned_profiles:

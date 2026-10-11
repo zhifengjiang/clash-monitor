@@ -189,7 +189,7 @@ class CompactRoundTests(unittest.TestCase):
         self.args.route_retry_delay = 0
         cfg = SimpleNamespace(sse_url="https://chatgpt.com/backend-api/codex/responses", mode="network", credentials=SimpleNamespace(mode="chatgpt"))
         with mock.patch.object(monitor.codex_probe, "settings", return_value=cfg), mock.patch.object(
-            monitor, "check_via_mixed_proxy", side_effect=[(False, "first connection failed"), (True, "200"), (True, "200")],
+            monitor, "check_via_mixed_proxy", side_effect=[(False, "first connection failed"), (True, "200"), (True, "200"), (True, "200"), (True, "200")],
         ), mock.patch.object(monitor.codex_probe, "run_step", return_value=(True, "pass")):
             retried, details = self.run_round()
             self.assertTrue(retried.had_errors)
